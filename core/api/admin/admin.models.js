@@ -32,7 +32,7 @@ module.exports = function AdminModel(logger, db, redisClient, mailService, slack
 
     const email = account.name;
     const role = 'admin';
-    const language = languageParam || 'en';
+    const language = languageParam || 'ru';
 
     // generate email confirmation token
     const token = (await randomBytes(64)).toString('hex');

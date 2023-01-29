@@ -7,7 +7,7 @@ describe('POST /admin/accounts/:id/resend', () => {
     return request(TEST_BACKEND_APP)
       .post('/admin/accounts/be2b9666-5c72-451e-98f4-efca76ffef54/resend')
       .send({
-        language: 'fr',
+        language: 'ru',
       })
       .set('Accept', 'application/json')
       .set('Authorization', configTest.jwtAccessTokenDashboard)

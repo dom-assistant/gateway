@@ -61,7 +61,7 @@ module.exports = function AccountModel(logger, db, redisClient, stripeService, m
     }
 
     const role = 'admin';
-    const language = session.locale ? session.locale.substr(0, 2).toLowerCase() : 'en';
+    const language = session.locale ? session.locale.substr(0, 2).toLowerCase() : 'ru';
 
     // we get subscription from stripe side
     const [subscription, customer] = await Promise.all([
@@ -403,7 +403,7 @@ module.exports = function AccountModel(logger, db, redisClient, stripeService, m
     let account;
     let usersInAccount;
     let email;
-    let language = 'fr'; // default language is in fr
+    let language = 'ru'; // default language is in fr
 
     if (event.data && event.data.object && event.data.object.customer && event.type !== 'checkout.session.completed') {
       // we get the account linked to the customer
@@ -429,7 +429,7 @@ module.exports = function AccountModel(logger, db, redisClient, stripeService, m
         // eslint-disable-next-line prefer-destructuring
         language = usersInAccount[0].language;
       } else {
-        language = 'fr';
+        language = 'ru';
       }
     }
 

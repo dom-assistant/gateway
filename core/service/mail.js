@@ -2,7 +2,7 @@ const Promise = require('bluebird');
 const nodemailer = require('nodemailer');
 const emails = require('../common/email');
 
-const SUPPORTED_LANGUAGE = ['en', 'fr'];
+const SUPPORTED_LANGUAGE = ['en', 'ru'];
 
 module.exports = function MailService(logger) {
   let transporter;
@@ -30,7 +30,7 @@ module.exports = function MailService(logger) {
     const user = userParam;
     // default language = fr
     if (SUPPORTED_LANGUAGE.indexOf(user.language) === -1) {
-      user.language = 'fr';
+      user.language = 'ru';
     }
 
     if (!emails[template] || !emails[template][user.language]) {
