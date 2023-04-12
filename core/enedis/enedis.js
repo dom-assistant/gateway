@@ -1,10 +1,13 @@
 const axios = require('axios');
+const AxiosLogger = require('axios-logger');
 const get = require('get-value');
 const Promise = require('bluebird');
 const dayjs = require('dayjs');
 const { Queue } = require('bullmq');
 const utc = require('dayjs/plugin/utc');
 const timezone = require('dayjs/plugin/timezone');
+
+const axiosInstance = axios.create();
 
 dayjs.extend(utc);
 dayjs.extend(timezone);
@@ -33,15 +36,29 @@ module.exports = function EnedisModel(logger, db, redisClient) {
     },
   });
 
-  // queue.add(ENEDIS_REFRESH_ALL_DATA_JOB_KEY, { userId: 'd35d2615-5a56-4aae-95a9-1b29a3b827ce' });
+  const responseLogger = (response) =>
+    AxiosLogger.responseLogger(response, {
+      data: false,
+      logger: logger.info.bind(this),
+    });
+
+  const requestLogger = (request) =>
+    AxiosLogger.requestLogger(request, {
+      logger: logger.info.bind(this),
+    });
+
+  const errorLogger = (error) =>
+    AxiosLogger.errorLogger(error, {
+      logger: logger.warn.bind(this),
+    });
+
+  axiosInstance.interceptors.request.use(requestLogger, errorLogger);
+  axiosInstance.interceptors.response.use(responseLogger, errorLogger);
 
   async function saveEnedisAccessTokenAndRefreshToken(accountId, deviceId, data) {
-    await redisClient.set(
-      `${ENEDIS_GRANT_ACCESS_TOKEN_REDIS_PREFIX}:${accountId}`,
-      data.access_token,
-      'EX',
-      data.expires_in - 60, // We remove 1 minute to be safe
-    );
+    await redisClient.set(`${ENEDIS_GRANT_ACCESS_TOKEN_REDIS_PREFIX}:${accountId}`, data.access_token, {
+      EX: data.expires_in - 60, // We remove 1 minute to be safe
+    });
 
     await db.t_device.update(deviceId, {
       provider_refresh_token: data.refresh_token,
@@ -80,15 +97,13 @@ module.exports = function EnedisModel(logger, db, redisClient) {
       url: `https://${ENEDIS_BACKEND_URL}/oauth2/v3/token`,
     };
     try {
-      const { data } = await axios(options);
+      const { data } = await axiosInstance(options);
       // save new refresh token
       await saveEnedisAccessTokenAndRefreshToken(accountId, device.id, data);
       return data.access_token;
     } catch (e) {
-      logger.error(e);
       // if status is 400, token is invalid, revoke token
       if (get(e, 'response.status') === 400) {
-        logger.warn(e);
         await db.t_device.update(device.device_id, {
           revoked: true,
         });
@@ -104,10 +119,11 @@ module.exports = function EnedisModel(logger, db, redisClient) {
       params: query,
       headers: {
         authorization: `Bearer ${accessToken}`,
+        accept: 'application/json',
       },
       url: `https://${ENEDIS_BACKEND_URL}${url}`,
     };
-    const { data } = await axios(options);
+    const { data } = await axiosInstance(options);
     return data;
   }
   async function increaseSyncJobDone(syncId) {
@@ -134,6 +150,8 @@ module.exports = function EnedisModel(logger, db, redisClient) {
       // if the response is 404 not found
       // It just mean the user has no data at this period so it's fine
       if (get(e, 'response.status') === 404) {
+        // If result is 404, job is done
+        await increaseSyncJobDone(syncId);
         return null;
       }
       logger.error(e);
@@ -175,6 +193,8 @@ module.exports = function EnedisModel(logger, db, redisClient) {
       // if the response is 404 not found
       // It just mean the user has no data at this period so it's fine
       if (get(e, 'response.status') === 404) {
+        // If result is 404, job is done
+        await increaseSyncJobDone(syncId);
         return null;
       }
       // Else, it's a problem, we exit to be replayed
@@ -202,6 +222,24 @@ module.exports = function EnedisModel(logger, db, redisClient) {
     await increaseSyncJobDone(syncId);
 
     return response;
+  }
+  async function getContract(accountId, usagePointId) {
+    logger.info(`Enedis - get contract for usagePoint = ${usagePointId}`);
+    const accessToken = await getAccessToken(accountId);
+    const data = {
+      usage_point_id: usagePointId,
+    };
+    let response;
+    try {
+      response = await makeRequest('/customers_upc/v5/usage_points/contracts', data, accessToken);
+    } catch (e) {
+      logger.error(e);
+      throw e;
+    }
+    const lastActivationDate = get(response, 'customer.usage_points.0.contracts.last_activation_date');
+    return {
+      lastActivationDate,
+    };
   }
   async function getUsagePoints(accountId) {
     const getUsagePointsSql = `
@@ -233,7 +271,17 @@ module.exports = function EnedisModel(logger, db, redisClient) {
     logger.info(`Enedis: Found ${usagePointIds.length} usage points for user ${job.userId}`);
     // Foreach usage points, we generate one job per request to make
     await Promise.each(usagePointIds, async (usagePointId) => {
-      const oldestDate = job.start ? dayjs(job.start) : dayjs().subtract(2, 'years');
+      const contract = await getContract(account.id, usagePointId);
+      let oldestDate = job.start ? dayjs(job.start) : dayjs().subtract(2, 'years');
+
+      // We cannot get data before lastActivationDate
+      if (contract && contract.lastActivationDate) {
+        const justTheDate = contract.lastActivationDate.substr(0, 10);
+        const lastActivationDate = dayjs(justTheDate);
+        if (oldestDate.isBefore(lastActivationDate)) {
+          oldestDate = lastActivationDate;
+        }
+      }
 
       let currendEndDate = dayjs();
       const syncTasksArray = [];
@@ -277,10 +325,10 @@ module.exports = function EnedisModel(logger, db, redisClient) {
         AND t_device.client_id = $1;
     `;
     const usersToRefresh = await db.query(getAllUsersWithEnedisSql, [ENEDIS_GRANT_CLIENT_ID]);
-    const twoDaysAgo = dayjs().subtract(2, 'day');
+    const oneWeekAgo = dayjs().subtract(6, 'day');
     logger.info(`Enedis: Daily refresh of all users. Refreshing ${usersToRefresh.length} users`);
     await Promise.each(usersToRefresh, async (userToRefresh) => {
-      await refreshAllData({ userId: userToRefresh.id, start: twoDaysAgo });
+      await refreshAllData({ userId: userToRefresh.id, start: oneWeekAgo });
     });
   }
   async function enedisSyncData(job) {
@@ -322,6 +370,7 @@ module.exports = function EnedisModel(logger, db, redisClient) {
     getAccessToken,
     getDataDailyConsumption,
     getConsumptionLoadCurve,
+    getContract,
     enedisSyncData,
     refreshAllData,
     dailyRefreshOfAllUsers,

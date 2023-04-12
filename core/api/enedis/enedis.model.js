@@ -1,5 +1,4 @@
 const uuid = require('uuid');
-const axios = require('axios');
 const { Queue } = require('bullmq');
 const Promise = require('bluebird');
 
@@ -13,8 +12,7 @@ const {
 const ENEDIS_GRANT_ACCESS_TOKEN_REDIS_PREFIX = 'enedis-grant-access-token:';
 
 module.exports = function EnedisModel(logger, db, redisClient) {
-  const { ENEDIS_GRANT_CLIENT_ID, ENEDIS_GRANT_CLIENT_SECRET, ENEDIS_BACKEND_URL, ENEDIS_GLADYS_PLUS_REDIRECT_URI } =
-    process.env;
+  const { ENEDIS_GRANT_CLIENT_ID, ENEDIS_AUTHORIZE_URL } = process.env;
 
   const queue = new Queue(ENEDIS_WORKER_KEY, {
     connection: {
@@ -25,14 +23,15 @@ module.exports = function EnedisModel(logger, db, redisClient) {
   });
 
   async function getRedirectUri() {
-    const url = `https://${ENEDIS_BACKEND_URL}/oauth2/v3/authorize`;
     const params = new URLSearchParams({
       client_id: ENEDIS_GRANT_CLIENT_ID,
       response_type: 'code',
+      duration: 'P2Y',
       state: `${uuid.v4()}7`, // add a 7 for the sandbox
-      redirect_uri: ENEDIS_GLADYS_PLUS_REDIRECT_URI,
+      //  Remove redirect_uri for Enedis PROD. Keeping the comment in case it's needed for test env
+      //  redirect_uri: ENEDIS_GLADYS_PLUS_REDIRECT_URI,
     });
-    return `${url}?${params.toString()}`;
+    return `${ENEDIS_AUTHORIZE_URL}?${params.toString()}`;
   }
 
   async function saveUsagePointIfNotExist(accountId, usagePointId) {
@@ -52,19 +51,6 @@ module.exports = function EnedisModel(logger, db, redisClient) {
 
   async function handleAcceptGrantMessage(authorizationCode, user, usagePointsIds = []) {
     logger.info(`Enedis.handleAcceptGrantMessage : ${user.id}`);
-    const params = new URLSearchParams();
-    params.append('grant_type', 'authorization_code');
-    params.append('code', authorizationCode);
-    params.append('client_id', ENEDIS_GRANT_CLIENT_ID);
-    params.append('client_secret', ENEDIS_GRANT_CLIENT_SECRET);
-    params.append('redirect_uri', ENEDIS_GLADYS_PLUS_REDIRECT_URI);
-    const options = {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      data: params,
-      url: `https://${ENEDIS_BACKEND_URL}/oauth2/v3/token`,
-    };
-    const { data } = await axios(options);
     // Delete all devices that could exist prior to this operation
     await db.t_device.update(
       {
@@ -95,14 +81,14 @@ module.exports = function EnedisModel(logger, db, redisClient) {
       await redisClient.del(`${ENEDIS_GRANT_ACCESS_TOKEN_REDIS_PREFIX}:${instances[0].account_id}`);
     }
 
-    // Create a new device to store the refresh token
+    // Create a new Enedis device
     const newDevice = {
       id: uuid.v4(),
       name: 'Enedis',
       client_id: ENEDIS_GRANT_CLIENT_ID,
       user_id: user.id,
-      provider_refresh_token: data.refresh_token,
     };
+
     await db.t_device.insert(newDevice);
 
     // Save usage points ids
