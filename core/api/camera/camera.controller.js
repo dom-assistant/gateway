@@ -1,19 +1,40 @@
-const aws = require('aws-sdk');
+const { S3, ListObjectsCommand, GetObjectCommand, DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { PassThrough } = require('stream');
 const axios = require('axios');
+const Promise = require('bluebird');
+const randomBytes = Promise.promisify(require('crypto').randomBytes);
+const { RateLimiterRedis } = require('rate-limiter-flexible');
 
 const asyncMiddleware = require('../../middleware/asyncMiddleware');
-const { NotFoundError, BadRequestError } = require('../../common/error');
+const { NotFoundError, BadRequestError, TooManyRequestsError } = require('../../common/error');
 
-aws.config.update({
-  signatureVersion: 'v4',
-  signatureCache: false,
-});
+const STREAMING_ACCESS_KEY_PREFIX = 'streaming-access-key';
 
-module.exports = function CameraController(logger, userModel, instanceModel) {
-  const spacesEndpoint = new aws.Endpoint(process.env.STORAGE_ENDPOINT);
+module.exports = function CameraController(
+  logger,
+  userModel,
+  instanceModel,
+  legacyRedisClient,
+  redisClient,
+  telegramService,
+) {
+  const s3Client = new S3({
+    forcePathStyle: false, // Configures to use subdomain/virtual calling format.
+    endpoint: `https://${process.env.STORAGE_ENDPOINT}`,
+    region: process.env.AWS_REGION,
+    credentials: {
+      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+    },
+  });
 
-  const s3 = new aws.S3({
-    endpoint: spacesEndpoint,
+  const trafficLimiter = new RateLimiterRedis({
+    storeClient: legacyRedisClient,
+    keyPrefix: 'rate_limit:camera_data_traffic',
+    points: 50 * 1024 * 1024 * 1024, // Max bytes per month of camera traffic allowed
+    duration: 30 * 24 * 60 * 60, // 30 days
   });
 
   const SESSION_ID_REGEX = /^camera-[a-zA-Z0-9-_]+$/;
@@ -46,16 +67,61 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
   async function writeCameraFile(req, res, next) {
     validateSessionId(req.params.session_id);
     validateFilename(req.params.filename);
+
+    const limiterResult = await trafficLimiter.get(req.instance.id);
+    if (limiterResult && limiterResult.remainingPoints <= 0) {
+      logger.warn(`Camera: Client ${req.instance.id} has used too much camera traffic.`);
+      throw new TooManyRequestsError('Too much camera traffic used this month');
+    }
+
+    const passThrough = new PassThrough();
+
     const key = `${req.instance.id}/${req.params.session_id}/${req.params.filename}`;
-    await s3
-      .putObject({
-        Bucket: process.env.CAMERA_STORAGE_BUCKET,
-        Key: key,
-        Body: req.body,
-      })
-      .promise();
+
+    const params = {
+      Bucket: process.env.CAMERA_STORAGE_BUCKET,
+      Key: key,
+      Body: passThrough,
+      ContentType: 'application/octet-stream',
+    };
+
+    const upload = new Upload({
+      client: s3Client,
+      params,
+    });
+
+    let streamLength = 0;
+    passThrough.on('data', (chunk) => {
+      streamLength += chunk.length;
+    });
+
+    req.pipe(passThrough);
+
+    await upload.done();
+
+    try {
+      await trafficLimiter.consume(req.instance.id, streamLength);
+    } catch (e) {
+      logger.warn(`Too many requests used this month, will fail at next call`);
+    }
+
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /cameras/streaming/start Start streaming
+   * @apiName startStreaming
+   * @apiGroup Camera
+   */
+  async function startStreaming(req, res, next) {
+    const user = await userModel.getMySelf(req.user);
+    telegramService.sendAlert(`User ${user.email} starting stream !`);
+    const streamAccessKey = (await randomBytes(36)).toString('hex');
+    await redisClient.set(`${STREAMING_ACCESS_KEY_PREFIX}:${streamAccessKey}`, req.user.id, {
+      EX: 60 * 60, // 1 hour in second
+    });
     res.json({
-      success: true,
+      stream_access_key: streamAccessKey,
     });
   }
 
@@ -74,14 +140,24 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
       res.send('not-a-key');
       return;
     }
-    const user = await userModel.getMySelf({ id: req.user.id });
-    const primaryInstance = await instanceModel.getPrimaryInstanceByAccount(user.account_id);
-    const key = `${primaryInstance.id}/${req.params.session_id}/${req.params.filename}`;
-    const signedUrl = await s3.getSignedUrlPromise('getObject', {
+    const primaryInstanceId = await instanceModel.getPrimaryInstanceIdByUserId(req.user.id);
+    const key = `${primaryInstanceId}/${req.params.session_id}/${req.params.filename}`;
+
+    const limiterResult = await trafficLimiter.get(primaryInstanceId);
+    if (limiterResult && limiterResult.remainingPoints <= 0) {
+      logger.warn(`Camera: Client ${primaryInstanceId} has used too much camera traffic.`);
+      throw new TooManyRequestsError('Too much camera traffic used this month');
+    }
+
+    const bucketParams = {
       Bucket: process.env.CAMERA_STORAGE_BUCKET,
       Key: key,
-      Expires: 6 * 60 * 60, // URL is valid 6 hours
+    };
+
+    const signedUrl = await getSignedUrl(s3Client, new GetObjectCommand(bucketParams), {
+      expiresIn: 6 * 60 * 60, // URL is valid 6 hours
     });
+
     try {
       const { data, headers } = await axios({
         url: signedUrl,
@@ -90,6 +166,11 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
       });
       res.setHeader('content-type', headers['content-type']);
       res.setHeader('content-length', headers['content-length']);
+      try {
+        await trafficLimiter.consume(primaryInstanceId, headers['content-length']);
+      } catch (e) {
+        logger.warn(`Camera: Client ${primaryInstanceId} has used too much camera traffic. Next query will fail.`);
+      }
       data.pipe(res);
     } catch (e) {
       logger.error(e);
@@ -104,12 +185,13 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
       Prefix: dir,
     };
 
-    const listedObjects = await s3.listObjectsV2(listParams).promise();
-    logger.info(`Camera: Found ${listedObjects.Contents.length} files to delete`);
+    const listedObjects = await s3Client.send(new ListObjectsCommand(listParams));
 
-    if (listedObjects.Contents.length === 0) {
+    if (!listedObjects.Contents || listedObjects.Contents.length === 0) {
       return;
     }
+
+    logger.info(`Camera: Found ${listedObjects.Contents.length} files to delete`);
 
     const deleteParams = {
       Bucket: bucket,
@@ -120,7 +202,7 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
       deleteParams.Delete.Objects.push({ Key });
     });
 
-    await s3.deleteObjects(deleteParams).promise();
+    await s3Client.send(new DeleteObjectsCommand(deleteParams));
 
     if (listedObjects.IsTruncated) {
       logger.info(`Camera: Still some file to clean in ${bucket} / ${dir}. Re-cleaning.`);
@@ -135,12 +217,14 @@ module.exports = function CameraController(logger, userModel, instanceModel) {
    */
   async function cleanCameraLive(req, res) {
     validateSessionId(req.params.session_id);
+    telegramService.sendAlert(`End of camera stream, session_id = ${req.params.session_id} !`);
     const folder = `${req.instance.id}/${req.params.session_id}`;
     await emptyS3Directory(process.env.CAMERA_STORAGE_BUCKET, folder);
     res.json({ success: true });
   }
 
   return {
+    startStreaming: asyncMiddleware(startStreaming),
     writeCameraFile: asyncMiddleware(writeCameraFile),
     getCameraFile: asyncMiddleware(getCameraFile),
     cleanCameraLive: asyncMiddleware(cleanCameraLive),
