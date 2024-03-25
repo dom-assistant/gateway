@@ -47,7 +47,7 @@ module.exports = function CameraController(
   };
 
   const AUTHORIZED_FILENAMES = ['index.m3u8', 'index.m3u8.key', 'key_info_file.txt'];
-  const HLS_CHUNK_REGEX = /index[0-9]+.ts/;
+  const HLS_CHUNK_REGEX = /^index[0-9]+.ts$/;
 
   const validateFilename = (filename) => {
     if (AUTHORIZED_FILENAMES.includes(filename)) {
@@ -114,8 +114,6 @@ module.exports = function CameraController(
    * @apiGroup Camera
    */
   async function startStreaming(req, res, next) {
-    const user = await userModel.getMySelf(req.user);
-    telegramService.sendAlert(`User ${user.email} starting stream !`);
     const streamAccessKey = (await randomBytes(36)).toString('hex');
     await redisClient.set(`${STREAMING_ACCESS_KEY_PREFIX}:${streamAccessKey}`, req.user.id, {
       EX: 60 * 60, // 1 hour in second
@@ -217,7 +215,6 @@ module.exports = function CameraController(
    */
   async function cleanCameraLive(req, res) {
     validateSessionId(req.params.session_id);
-    telegramService.sendAlert(`End of camera stream, session_id = ${req.params.session_id} !`);
     const folder = `${req.instance.id}/${req.params.session_id}`;
     await emptyS3Directory(process.env.CAMERA_STORAGE_BUCKET, folder);
     res.json({ success: true });
