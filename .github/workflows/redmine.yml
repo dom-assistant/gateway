@@ -1,7 +1,9 @@
 name: update Redmine issue
 on:
-  pull_requests:
-    types: [opened, closed, reopened]
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
 
 jobs:
   action:
