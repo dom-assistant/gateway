@@ -1,0 +1,13 @@
+name: update Redmine issue
+on:
+  pull_requests:
+    types: [opened, closed, reopened]
+
+jobs:
+  action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: thaim/redmine-integration-action@main
+        with:
+          redmine_host: ${{ secrets.REDMINE_HOST }}
+          redmine_apikey: ${{ secrets.REDMINE_API_KEY}}
