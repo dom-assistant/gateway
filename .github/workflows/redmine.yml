@@ -1,4 +1,4 @@
-name: update Redmine issue
+name: update Redmine issue 
 on:
   pull_request:
     branches: [master]
